@@ -14,7 +14,7 @@ let compile source : string =
   let ir = Mem2reg.promote ir in
   
   (* 5. IR 优化 *)
-  let ir = Const_fold.run ir in      (* 常量折叠 *)
+  (* let ir = Const_fold.run ir in      (* 常量折叠 *)
   let ir = Reassociate.run ir in      (* 重关联 (LLVM: -reassociate) *)
   let ir = Const_fold.run ir in       (* 再折叠, reassociate 暴露新常量 *)
   (*let ir = Tail_call_elim.run ir in   (*尾递归消除: 有问题, 暂不开 (产生循环结构供后续 loop opt) *)*)
@@ -55,6 +55,7 @@ let compile source : string =
   let ir = Jump_thread.run ir in
   (* let ir = Simplifycfg.run ir in   ← 同上: 在 Loop_unroll 之后, 待图着色分配器落地后再开 *)
 
+   *)
     (* 6. 活跃区间分析 *)
   let intervals = Live_intervals.compute_module ir in
     (* 7. 寄存器分配 *)
