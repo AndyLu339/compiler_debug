@@ -27,12 +27,13 @@ let join_lattice a b =
       if x = y then Const x else Overdefined
 
 let eval_binop_const (op : binary_op) (a : int) (b : int) : int =
+  let a = wrap32 a and b = wrap32 b in
   match op with
-  | Add -> a + b
-  | Sub -> a - b
-  | Mul -> a * b
-  | Div -> a / b
-  | Mod -> a mod b
+  | Add -> wrap32 (a + b)
+  | Sub -> wrap32 (a - b)
+  | Mul -> wrap32 (a * b)
+  | Div -> wrap32 (a / b)
+  | Mod -> wrap32 (a mod b)
   | Eq  -> if a = b then 1 else 0
   | Ne  -> if a <> b then 1 else 0
   | Lt  -> if a < b then 1 else 0
@@ -42,6 +43,7 @@ let eval_binop_const (op : binary_op) (a : int) (b : int) : int =
   | LAnd | LOr -> failwith "LAnd/LOr should be lowered before IR"
 
 let eval_icmp_const (cond : icmp_cond) (a : int) (b : int) : int =
+  let a = wrap32 a and b = wrap32 b in
   match cond with
   | IEq  -> if a = b then 1 else 0
   | INe  -> if a <> b then 1 else 0

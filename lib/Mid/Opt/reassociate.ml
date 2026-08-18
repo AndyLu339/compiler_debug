@@ -22,8 +22,8 @@ let normalize_commutative a b =
 
 let combine_imm op a b =
   match op with
-  | Add -> Some (a + b)
-  | Mul -> Some (a * b)
+  | Add -> Some (wrap32 (a + b))
+  | Mul -> Some (wrap32 (a * b))
   | _ -> None
 
 let peel_same_op_const (def_map : instr IntMap.t) (op : binary_op) (v : value)

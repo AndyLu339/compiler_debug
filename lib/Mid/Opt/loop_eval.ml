@@ -57,12 +57,13 @@ let const_of_expr (e : sym_expr) =
   if IntMap.is_empty e.terms then Some e.const else None
 
 let eval_binop (op : binary_op) (l : int) (r : int) : int =
+  let l = wrap32 l and r = wrap32 r in
   match op with
-  | Add -> l + r
-  | Sub -> l - r
-  | Mul -> l * r
-  | Div -> l / r
-  | Mod -> l mod r
+  | Add -> wrap32 (l + r)
+  | Sub -> wrap32 (l - r)
+  | Mul -> wrap32 (l * r)
+  | Div -> wrap32 (l / r)
+  | Mod -> wrap32 (l mod r)
   | Eq  -> if l = r then 1 else 0
   | Ne  -> if l <> r then 1 else 0
   | Lt  -> if l < r then 1 else 0
@@ -72,6 +73,7 @@ let eval_binop (op : binary_op) (l : int) (r : int) : int =
   | LAnd | LOr -> failwith "LAnd/LOr should be lowered before IR"
 
 let eval_icmp (cond : icmp_cond) (l : int) (r : int) : int =
+  let l = wrap32 l and r = wrap32 r in
   match cond with
   | IEq  -> if l = r then 1 else 0
   | INe  -> if l <> r then 1 else 0

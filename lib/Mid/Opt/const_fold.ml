@@ -6,10 +6,14 @@ open Common
 
 module IntMap = Map.Make (Int)
 
+(* 折叠时用 Common.wrap32 模拟 RV32 的 32 位回绕，
+   避免溢出常量被误当作 64 位值参与后续比较。 *)
+
 let eval_binop (op : binary_op) (l : int) (r : int) : int =
+  let l = wrap32 l and r = wrap32 r in
   match op with
-  | Add -> l + r | Sub -> l - r | Mul -> l * r
-  | Div -> l / r | Mod -> l mod r
+  | Add -> wrap32 (l + r) | Sub -> wrap32 (l - r) | Mul -> wrap32 (l * r)
+  | Div -> wrap32 (l / r) | Mod -> wrap32 (l mod r)
   | Eq  -> if l = r  then 1 else 0
   | Ne  -> if l <> r then 1 else 0
   | Lt  -> if l < r  then 1 else 0
@@ -21,10 +25,11 @@ let eval_binop (op : binary_op) (l : int) (r : int) : int =
 (* 检查是否应该折叠：除数为 0 时不折叠，保留到运行时 *)
 let can_fold_binop (op : binary_op) (_l : int) (r : int) : bool =
   match op with
-  | Div | Mod -> r <> 0
+  | Div | Mod -> wrap32 r <> 0
   | _ -> true
 
 let eval_icmp (cond : icmp_cond) (l : int) (r : int) : int =
+  let l = wrap32 l and r = wrap32 r in
   match cond with
   | IEq  -> if l = r  then 1 else 0  | INe  -> if l <> r then 1 else 0
   | ISlt -> if l < r  then 1 else 0  | ISle -> if l <= r then 1 else 0
@@ -78,7 +83,7 @@ let run_on_func (f : func) : func =
         | Icmp { dst; cond; lhs = Imm a; rhs = Imm b } ->
             repl := IntMap.add dst (Imm (eval_icmp cond a b)) !repl
         | Zext { dst; src = Imm v } ->
-            repl := IntMap.add dst (Imm v) !repl
+            repl := IntMap.add dst (Imm (v land 1)) !repl
         | _ -> ()
       ) bb.bb_instrs
     ) f.f_blocks;
