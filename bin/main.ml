@@ -48,8 +48,8 @@ let compile source : string =
   
   (* let ir = Sccp.run ir in *)
   let ir = Branch_fold.run ir in
-  let ir = Dce.run ir in
-  (*let ir = Algebraic.run ir in        (* 再代数化简 *)
+  (*let ir = Dce.run ir in
+  let ir = Algebraic.run ir in        (* 再代数化简 *)
   let ir = Dead_store_elim.run ir in  (* 循环变换后再做 DSE，收益更稳定 *)
 
   let ir = Gvn.run ir in              (* 全局值编号 *)
