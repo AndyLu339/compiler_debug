@@ -16,7 +16,7 @@ let compile source : string =
   
   (* 5. IR 优化 *)
   let ir = Const_fold.run ir in      (* 常量折叠 *)
-  let ir = Reassociate.run ir in      (* 重关联 *)
+  (*let ir = Reassociate.run ir in      重关联 *)
   let ir = Const_fold.run ir in       (* 再折叠, reassociate 暴露新常量 *)
   (*let ir = Inline.run ir in           (* 函数内联 *)
   let ir = Deadarg_elim.run ir in     (* 死参数消除  *)
