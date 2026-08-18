@@ -28,14 +28,14 @@ let compile source : string =
   let ir = Dce.run ir in              (* 死代码消除 *)
   let ir = Const_prop.run ir in       (* 常量传播 *)
 
-  let ir = Sccp.run ir in             (* 稀疏条件常量传播 *)
+  (*let ir = Sccp.run ir in             (* 稀疏条件常量传播 *)*)
   let ir = Branch_fold.run ir in      (* 常量分支折叠 + 不可达块删除 *)
-  (*let ir = Dce.run ir in              (* 清理 Branch_fold 产生的死代码 *)
+  let ir = Dce.run ir in              (* 清理 Branch_fold 产生的死代码 *)
   let ir = Jump_thread.run ir in      (* 跳转穿透: Branch_fold 之后才有空块可穿 *)
   let ir = Simplifycfg.run ir in      (* 控制流化简: 块合并 + phi 简化 + 分支化简 *)
 
   (* loop opts *)
-  let ir = Loop_canonicalize.run ir in (* 循环规范化，整理简单 while-loop 形状与出口 SSA *)
+  (*let ir = Loop_canonicalize.run ir in (* 循环规范化，整理简单 while-loop 形状与出口 SSA *)
   let ir = Licm.run ir in             (* 循环不变量外提  *)
   let ir = Loop_unswitch.run ir in    (* 循环分支外提 *)
   let ir = Indvars.run ir in          (* 归纳变量化简 + 强度削减  *)
