@@ -94,8 +94,13 @@ let build_loop (header : label) (body_blocks : IntSet.t) (latches : label list)
     blocks = body_blocks; exiting = !exiting; exits = !exits;
     parent; depth }
 
-(* 合并共享 header 的循环 *)
-let merge_loops (loops : loop list) : loop list =
+(* 合并共享 header 的循环。
+   参考 LLVM LoopInfo 的思路，循环的 exiting/exits/preheader 等元数据
+   必须基于最终合并后的 blocks 重新计算，不能沿用某个 raw loop 的旧值。 *)
+let merge_loops
+    (loops : loop list)
+    (succs : IntSet.t IntMap.t)
+    (preds : IntSet.t IntMap.t) : loop list =
   let by_header = ref IntMap.empty in
   List.iter (fun lp ->
     by_header := IntMap.update lp.header (fun prev ->
@@ -109,16 +114,11 @@ let merge_loops (loops : loop list) : loop list =
       let merged_blocks = List.fold_left (fun s lp ->
         IntSet.union s lp.blocks
       ) IntSet.empty lp_list in
-      let merged_latches = List.concat_map (fun lp -> lp.latches) lp_list in
-      { header;
-        preheader = (List.hd lp_list).preheader;
-        latches = merged_latches;
-        blocks = merged_blocks;
-        exiting = (List.hd lp_list).exiting;
-        exits = (List.hd lp_list).exits;
-        parent = (List.hd lp_list).parent;
-        depth = (List.hd lp_list).depth
-      } :: acc
+      let merged_latches =
+        List.concat_map (fun lp -> lp.latches) lp_list
+        |> List.sort_uniq compare
+      in
+      build_loop header merged_blocks merged_latches succs preds 1 None :: acc
   ) !by_header []
 
 (* 计算嵌套关系和深度 *)
@@ -164,7 +164,7 @@ let analyze (f : func) (dom : Dominance.dom_info) : loop_info =
     ) back_edges
   in
 
-  let merged = merge_loops raw_loops in
+  let merged = merge_loops raw_loops !succs preds in
   let nested = compute_nesting merged in
 
   let loop_of = ref IntMap.empty in

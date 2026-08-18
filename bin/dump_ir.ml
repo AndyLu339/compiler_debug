@@ -31,8 +31,10 @@ let full_opt ir =
   let ir = Dce.run ir in
   let ir = Jump_thread.run ir in
   let ir = Simplifycfg.run ir in
-  let ir = Dead_store_elim.run ir in
+  let ir = Loop_canonicalize.run ir in
   let ir = Licm.run ir in
+  let ir = Loop_unswitch.run ir in
+  let ir = Indvars.run ir in
   let ir = Loop_eval.run ir in
   let ir = Loop_unroll.run ir in
   let ir = Const_fold.run ir in
@@ -41,6 +43,7 @@ let full_opt ir =
   let ir = Branch_fold.run ir in
   let ir = Dce.run ir in
   let ir = Algebraic.run ir in
+  let ir = Dead_store_elim.run ir in
   ir
 
 let full_compile ir =

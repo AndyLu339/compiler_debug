@@ -1,8 +1,9 @@
 (* ToyC 优化 — 循环展开
-    loop-unroll 的保守思路：
-   - 只处理可证明精确 trip count 的小循环
-   - 只做完全展开，不做运行时余数循环
-   - 只接受 canonical counted loop *)
+    参考 LLVM：counted loop 的识别基于 preheader/header/latch/exit 的规范形，
+   而不是把“只有两个块”当成 counted loop 的定义。
+   本文件把 counted loop 的公共识别与 loop-unroll 自身可处理的简化子集分开：
+   - detect_counted_loop: 识别一般的 canonical counted loop
+   - detect_simple_unroll_loop: 只接受当前完全展开器真正能处理的两块子集 *)
 
 open Ir_types
 open Common
@@ -17,14 +18,34 @@ let max_unrolled_instrs = 64
 type counted_loop = {
   header       : label;
   preheader    : label;
-  body         : label;
+  body_entry   : label;
   exit_block   : label;
   trip_count   : int;
-  phis         : (int * value * value) list;  (* dst, init, latch_val *)
+  iv           : int;
+  step         : int;
+  latches      : label list;
+  blocks       : IntSet.t;
+  phis         : phi_info list;
+}
+
+and phi_info = {
+  dst             : int;
+  init            : value;
+  latch_incomings : (label * value) list;
+}
+
+type simple_unroll_loop = {
+  counted : counted_loop;
+  body    : label;
 }
 
 let build_bmap (f : func) =
   List.fold_left (fun m (lbl, bb) -> IntMap.add lbl bb m) IntMap.empty f.f_blocks
+
+let unique_labels labels =
+  labels
+  |> List.fold_left (fun seen lbl -> IntSet.add lbl seen) IntSet.empty
+  |> IntSet.elements
 
 let map_value (f : int -> value option) (v : value) =
   match v with
@@ -114,6 +135,9 @@ let partition_header_instrs (bb : basic_block) =
 let find_incoming lbl incoming =
   List.find_map (fun (v, pred) -> if pred = lbl then Some v else None) incoming
 
+let find_latch_value lbl incoming =
+  List.find_map (fun (pred, v) -> if pred = lbl then Some v else None) incoming
+
 let rec extract_compare defs (v : value) =
   match v with
   | Imm _ | Global _ -> None
@@ -164,34 +188,47 @@ let rec extract_step body_defs iv = function
       | _ ->
           None
 
+let build_defs_of_instrs instrs =
+  List.fold_left (fun defs instr ->
+    match instr_dst instr with
+    | Some dst -> IntMap.add dst instr defs
+    | None -> defs
+  ) IntMap.empty instrs
+
+let build_loop_defs (bmap : basic_block IntMap.t) (lp : loop) =
+  IntSet.fold (fun lbl defs ->
+    let bb = IntMap.find lbl bmap in
+    let instrs =
+      if lbl = lp.header then
+        snd (partition_header_instrs bb)
+      else
+        bb.bb_instrs
+    in
+    List.fold_left (fun defs instr ->
+      match instr_dst instr with
+      | Some dst -> IntMap.add dst instr defs
+      | None -> defs
+    ) defs instrs
+  ) lp.blocks IntMap.empty
+
 let detect_counted_loop (bmap : basic_block IntMap.t) (lp : loop) =
   try
-    if IntSet.cardinal lp.blocks <> 2 then None else
-    match lp.preheader, lp.latches with
-    | Some preheader, [ body ] ->
+    match lp.preheader, unique_labels lp.latches with
+    | Some preheader, latches when latches <> [] ->
         let header_bb = IntMap.find lp.header bmap in
-        let body_bb = IntMap.find body bmap in
-        if List.exists (function Alloca _ | Phi _ -> true | _ -> false) body_bb.bb_instrs
-        then raise Exit;
-        begin match body_bb.bb_term with
-        | Jump lbl when lbl = lp.header -> ()
-        | _ -> raise Exit
-        end;
         begin match header_bb.bb_term with
         | Br (cond_v, t_lbl, f_lbl) ->
-            let body_on_true, exit_block =
-              if t_lbl = body && f_lbl <> body then (true, f_lbl)
-              else if f_lbl = body && t_lbl <> body then (false, t_lbl)
+            let t_in_loop = IntSet.mem t_lbl lp.blocks in
+            let f_in_loop = IntSet.mem f_lbl lp.blocks in
+            let body_on_true, body_entry, exit_block =
+              if t_in_loop && not f_in_loop then (true, t_lbl, f_lbl)
+              else if f_in_loop && not t_in_loop then (false, f_lbl, t_lbl)
               else raise Exit
             in
+            let exiting = unique_labels lp.exiting in
+            if exiting <> [ lp.header ] then raise Exit;
             let header_phis, header_rest = partition_header_instrs header_bb in
-            let header_defs =
-              List.fold_left (fun defs instr ->
-                match instr_dst instr with
-                | Some dst -> IntMap.add dst instr defs
-                | None -> defs
-              ) IntMap.empty header_rest
-            in
+            let header_defs = build_defs_of_instrs header_rest in
             let (cmp_cond, lhs, rhs, negated) =
               match extract_compare header_defs cond_v with
               | Some info -> info
@@ -206,13 +243,7 @@ let detect_counted_loop (bmap : basic_block IntMap.t) (lp : loop) =
               | Some info -> info
               | None -> raise Exit
             in
-            let body_defs =
-              List.fold_left (fun defs instr ->
-                match instr_dst instr with
-                | Some dst -> IntMap.add dst instr defs
-                | None -> defs
-              ) IntMap.empty body_bb.bb_instrs
-            in
+            let loop_defs = build_loop_defs bmap lp in
             let phis =
               List.map (function
                 | Phi { dst; incoming } ->
@@ -221,37 +252,84 @@ let detect_counted_loop (bmap : basic_block IntMap.t) (lp : loop) =
                       | Some v -> v
                       | None -> raise Exit
                     in
-                    let latch =
-                      match find_incoming body incoming with
-                      | Some v -> v
-                      | None -> raise Exit
+                    let latch_incomings =
+                      List.map (fun latch ->
+                        match find_incoming latch incoming with
+                        | Some v -> (latch, v)
+                        | None -> raise Exit
+                      ) latches
                     in
-                    (dst, init, latch)
+                    { dst; init; latch_incomings }
                 | _ -> raise Exit
               ) header_phis
             in
-            let trip_count =
-              match List.find_opt (fun (dst, _, _) -> dst = iv) phis with
-              | Some (_, Imm init, latch_v) ->
-                  let step =
-                    match extract_step body_defs iv latch_v with
-                    | Some s when s <> 0 -> s
-                    | _ -> raise Exit
+            let iv_phi =
+              match List.find_opt (fun phi -> phi.dst = iv) phis with
+              | Some phi -> phi
+              | None -> raise Exit
+            in
+            let init, step =
+              match iv_phi.init with
+              | Imm init ->
+                  let steps =
+                    List.map (fun (_, latch_v) ->
+                      match extract_step loop_defs iv latch_v with
+                      | Some s when s <> 0 -> s
+                      | _ -> raise Exit
+                    ) iv_phi.latch_incomings
                   in
-                  begin match compute_trip_count init step continue_cond bound with
-                  | Some n -> n
-                  | None -> raise Exit
+                  begin match steps with
+                  | [] -> raise Exit
+                  | step :: rest when List.for_all (( = ) step) rest -> (init, step)
+                  | _ -> raise Exit
                   end
               | _ ->
                   raise Exit
             in
-            if trip_count > max_full_unroll_count then raise Exit;
-            if trip_count * List.length body_bb.bb_instrs > max_unrolled_instrs
-            then raise Exit;
-            Some { header = lp.header; preheader; body; exit_block; trip_count; phis }
+            let trip_count =
+              match compute_trip_count init step continue_cond bound with
+              | Some n -> n
+              | None -> raise Exit
+            in
+            Some {
+              header = lp.header;
+              preheader;
+              body_entry;
+              exit_block;
+              trip_count;
+              iv;
+              step;
+              latches;
+              blocks = lp.blocks;
+              phis;
+            }
         | _ ->
             None
         end
+    | _ ->
+        None
+  with Exit ->
+    None
+
+let detect_simple_unroll_loop (bmap : basic_block IntMap.t) (spec : counted_loop) =
+  try
+    let body_blocks =
+      IntSet.remove spec.header spec.blocks
+      |> IntSet.elements
+    in
+    match spec.latches, body_blocks with
+    | [ body ], [ body' ] when body = body' && body = spec.body_entry ->
+        let body_bb = IntMap.find body bmap in
+        if List.exists (function Alloca _ | Phi _ -> true | _ -> false) body_bb.bb_instrs
+        then raise Exit;
+        begin match body_bb.bb_term with
+        | Jump lbl when lbl = spec.header -> ()
+        | _ -> raise Exit
+        end;
+        if spec.trip_count > max_full_unroll_count then raise Exit;
+        if spec.trip_count * List.length body_bb.bb_instrs > max_unrolled_instrs
+        then raise Exit;
+        Some { counted = spec; body }
     | _ ->
         None
   with Exit ->
@@ -295,14 +373,16 @@ let clone_instr fresh remap = function
       let dst' = fresh () in
       (Copy { dst = dst'; src = remap src }, (dst, dst'))
 
-let apply_unroll (f : func) (bmap : basic_block IntMap.t) (spec : counted_loop) =
+let apply_unroll (f : func) (bmap : basic_block IntMap.t) (simple : simple_unroll_loop) =
   let next_label = ref (f.f_max_label + 1) in
   let next_vreg = ref (f.f_max_vreg + 1) in
   let fresh_label () = let x = !next_label in incr next_label; x in
   let fresh_vreg () = let x = !next_vreg in incr next_vreg; x in
+  let spec = simple.counted in
+  let body = simple.body in
 
   let header_bb = IntMap.find spec.header bmap in
-  let body_bb = IntMap.find spec.body bmap in
+  let body_bb = IntMap.find body bmap in
   let _, header_rest = partition_header_instrs header_bb in
   if header_rest = [] then raise Exit;
 
@@ -319,7 +399,7 @@ let apply_unroll (f : func) (bmap : basic_block IntMap.t) (spec : counted_loop) 
   in
 
   let init_curr =
-    List.fold_left (fun m (dst, init, _) -> IntMap.add dst init m)
+      List.fold_left (fun m phi -> IntMap.add phi.dst phi.init m)
       IntMap.empty spec.phis
   in
 
@@ -341,8 +421,13 @@ let apply_unroll (f : func) (bmap : basic_block IntMap.t) (spec : counted_loop) 
             cloned
           ) body_bb.bb_instrs
         in
-        curr := List.fold_left (fun m (dst, _, latch_v) ->
-          IntMap.add dst (remap latch_v) m
+          curr := List.fold_left (fun m phi ->
+            let latch_v =
+              match find_latch_value body phi.latch_incomings with
+              | Some v -> v
+              | None -> raise Exit
+            in
+            IntMap.add phi.dst (remap latch_v) m
         ) IntMap.empty spec.phis;
         built := { bb_label = lbl; bb_instrs = instrs; bb_term = Jump next_target } :: !built
       ) clone_labels targets;
@@ -353,7 +438,7 @@ let apply_unroll (f : func) (bmap : basic_block IntMap.t) (spec : counted_loop) 
 
   let remaining =
     IntMap.filter (fun lbl _ ->
-      lbl <> spec.header && lbl <> spec.body
+        not (IntSet.mem lbl spec.blocks)
     ) bmap
     |> IntMap.map (fun bb ->
       let bb =
@@ -367,13 +452,16 @@ let apply_unroll (f : func) (bmap : basic_block IntMap.t) (spec : counted_loop) 
       else if bb.bb_label = spec.exit_block then
         let fix_instr = function
           | Phi p ->
-              let incoming =
-                List.map (fun (v, lbl) ->
-                  if lbl = spec.header then
-                    (v, new_exit_pred)
-                  else
-                    (v, lbl)
-                ) p.incoming
+                let incoming =
+                  List.filter_map (fun (v, lbl) ->
+                    if IntSet.mem lbl spec.blocks then
+                      if lbl = spec.header then
+                        Some (v, new_exit_pred)
+                      else
+                        None
+                    else
+                      Some (v, lbl)
+                  ) p.incoming
               in
               Phi { p with incoming }
           | i -> i
@@ -406,11 +494,15 @@ let run_on_func (f : func) : func =
         if c <> 0 then c else compare a.header b.header
       ) li.loops
     in
-    match List.find_map (detect_counted_loop bmap) loops with
-    | None ->
-        f
-    | Some spec ->
-        fixpoint (apply_unroll f bmap spec)
+      match List.find_map (fun lp ->
+        match detect_counted_loop bmap lp with
+        | None -> None
+        | Some spec -> detect_simple_unroll_loop bmap spec
+      ) loops with
+      | None ->
+          f
+      | Some simple ->
+          fixpoint (apply_unroll f bmap simple)
   in
   fixpoint f
 

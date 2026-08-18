@@ -14,6 +14,18 @@ module IntSet = U.IntSet
 let build_bmap (f : func) : basic_block IntMap.t =
   U.build_bmap f
 
+let build_preds (bmap : basic_block IntMap.t) : IntSet.t IntMap.t =
+  IntMap.fold (fun lbl bb acc ->
+    List.fold_left (fun acc succ ->
+      IntMap.update succ (fun prev ->
+        Some (IntSet.add lbl (Option.value ~default:IntSet.empty prev))
+      ) acc
+    ) acc (match bb.bb_term with
+      | Jump l -> [ l ]
+      | Br (_, t, f) -> [ t; f ]
+      | Ret _ -> [])
+  ) bmap IntMap.empty
+
 (* 返回终结指令的后继标号。 *)
 let term_succs = function
   | Jump l -> [ l ]
@@ -47,6 +59,35 @@ let remap_value (vmap : int IntMap.t) (v : value) : value =
 let remap_instr_uses (vmap : int IntMap.t) (i : instr) : instr =
   let f r = Option.map (fun r' -> VReg r') (IntMap.find_opt r vmap) in
   U.map_instr_values f i
+
+let header_outside_preds (preds : IntSet.t IntMap.t) (lp : loop) : label list =
+  match IntMap.find_opt lp.header preds with
+  | None -> []
+  | Some pred_set ->
+      IntSet.elements
+        (IntSet.filter (fun pred -> not (IntSet.mem pred lp.blocks)) pred_set)
+
+let has_dedicated_exits (preds : IntSet.t IntMap.t) (lp : loop) : bool =
+  lp.exits
+  |> List.sort_uniq compare
+  |> List.for_all (fun exit_lbl ->
+       let pred_set =
+         Option.value ~default:IntSet.empty (IntMap.find_opt exit_lbl preds)
+       in
+       IntSet.for_all (fun pred -> IntSet.mem pred lp.blocks) pred_set)
+
+let canonical_loop_ready_for_unswitch (bmap : basic_block IntMap.t)
+    (preds : IntSet.t IntMap.t) (lp : loop) : label option =
+  match lp.preheader with
+  | None ->
+      None
+  | Some preheader ->
+      let preheader_bb = IntMap.find preheader bmap in
+      let outside_preds = header_outside_preds preds lp in
+      if preheader_bb.bb_term <> Jump lp.header then None
+      else if outside_preds <> [ preheader ] then None
+      else if not (has_dedicated_exits preds lp) then None
+      else Some preheader
 
 (* 在循环体中寻找条件为循环不变量的可外提分支。 *)
 let find_unswitch_branch (f : func) (bmap : basic_block IntMap.t) (lp : loop)
@@ -248,111 +289,101 @@ let rewrite_outside_uses (bmap : basic_block IntMap.t) (orig_bmap : basic_block 
 (* 对单个循环执行分支外提克隆；失败返回 None。 *)
 let apply_unswitch (f : func) (bmap : basic_block IntMap.t) (lp : loop)
     : (basic_block IntMap.t * int * int) option =
-  match lp.preheader with
+  let preds = build_preds bmap in
+  match canonical_loop_ready_for_unswitch bmap preds lp with
   | None -> None
   | Some preheader ->
       let preheader_bb = IntMap.find preheader bmap in
-      begin match preheader_bb.bb_term with
-      | Jump target when target = lp.header ->
-          let branch_opt = find_unswitch_branch f bmap lp in
-          begin match branch_opt with
-          | None -> None
-          | Some (branch_lbl, cond, _t_lbl, _f_lbl) ->
-              if IntMap.exists (fun lbl bb ->
-                not (IntSet.mem lbl lp.blocks) && lbl <> preheader
-                && List.exists (fun s -> IntSet.mem s lp.blocks) (term_succs bb.bb_term))
-                bmap
-              then None
-              else begin
-                let next_label = ref (f.f_max_label + 1) in
-                let next_vreg = ref (f.f_max_vreg + 1) in
-                let fresh_label () = let x = !next_label in incr next_label; x in
-                let fresh_vreg () = let x = !next_vreg in incr next_vreg; x in
+      let branch_opt = find_unswitch_branch f bmap lp in
+      begin match branch_opt with
+      | None -> None
+      | Some (branch_lbl, cond, _t_lbl, _f_lbl) ->
+          let next_label = ref (f.f_max_label + 1) in
+          let next_vreg = ref (f.f_max_vreg + 1) in
+          let fresh_label () = let x = !next_label in incr next_label; x in
+          let fresh_vreg () = let x = !next_vreg in incr next_vreg; x in
 
-                let loop_labels = IntSet.elements lp.blocks in
+          let loop_labels = IntSet.elements lp.blocks in
 
-                let true_lmap, false_lmap =
-                  build_clone_label_maps loop_labels fresh_label in
-                let true_vmap, false_vmap =
-                  build_clone_vreg_maps bmap loop_labels fresh_vreg in
+          let true_lmap, false_lmap =
+            build_clone_label_maps loop_labels fresh_label in
+          let true_vmap, false_vmap =
+            build_clone_vreg_maps bmap loop_labels fresh_vreg in
 
-                let label_of side l =
-                  if IntSet.mem l lp.blocks then
-                    if side then IntMap.find l true_lmap else IntMap.find l false_lmap
-                  else l
+          let label_of side l =
+            if IntSet.mem l lp.blocks then
+              if side then IntMap.find l true_lmap else IntMap.find l false_lmap
+            else l
+          in
+          let value_of side v =
+            let vmap = if side then true_vmap else false_vmap in
+            remap_value vmap v
+          in
+
+          let clone_instr side instr =
+            let vmap = if side then true_vmap else false_vmap in
+            match instr with
+            | Phi p ->
+                let incoming =
+                  List.map (fun (v, pred) ->
+                    (value_of side v, label_of side pred)) p.incoming
                 in
-                let value_of side v =
-                  let vmap = if side then true_vmap else false_vmap in
-                  remap_value vmap v
-                in
+                Phi { dst = IntMap.find p.dst vmap; incoming }
+            | _ ->
+                let mapped = remap_instr_uses vmap instr in
+                (match instr_dst instr with
+                 | Some old_dst ->
+                     set_instr_dst (IntMap.find old_dst vmap) mapped
+                 | None -> mapped)
+          in
 
-                let clone_instr side instr =
-                  let vmap = if side then true_vmap else false_vmap in
-                  match instr with
-                  | Phi p ->
-                      let incoming =
-                        List.map (fun (v, pred) ->
-                          (value_of side v, label_of side pred)) p.incoming
-                      in
-                      Phi { dst = IntMap.find p.dst vmap; incoming }
-                  | _ ->
-                      let mapped = remap_instr_uses vmap instr in
-                      (match instr_dst instr with
-                       | Some old_dst ->
-                           set_instr_dst (IntMap.find old_dst vmap) mapped
-                       | None -> mapped)
-                in
+          let clone_term side bb_label =
+            function
+            | Ret v -> Ret (Option.map (value_of side) v)
+            | Jump l -> Jump (label_of side l)
+            | Br (cond, t_lbl, f_lbl) ->
+                if bb_label = branch_lbl then
+                  if side then Jump (label_of side t_lbl)
+                  else Jump (label_of side f_lbl)
+                else
+                  Br (value_of side cond, label_of side t_lbl, label_of side f_lbl)
+          in
 
-                let clone_term side bb_label =
-                  function
-                  | Ret v -> Ret (Option.map (value_of side) v)
-                  | Jump l -> Jump (label_of side l)
-                  | Br (cond, t_lbl, f_lbl) ->
-                      if bb_label = branch_lbl then
-                        if side then Jump (label_of side t_lbl)
-                        else Jump (label_of side f_lbl)
-                      else
-                        Br (value_of side cond, label_of side t_lbl, label_of side f_lbl)
+          let clones =
+            List.concat_map (fun side ->
+              List.map (fun lbl ->
+                let bb = IntMap.find lbl bmap in
+                let new_lbl = label_of side lbl in
+                let new_bb =
+                  { bb_label = new_lbl;
+                    bb_instrs = List.map (clone_instr side) bb.bb_instrs;
+                    bb_term = clone_term side lbl bb.bb_term }
                 in
+                (new_lbl, new_bb)
+              ) loop_labels
+            ) [ true; false ]
+          in
 
-                let clones =
-                  List.concat_map (fun side ->
-                    List.map (fun lbl ->
-                      let bb = IntMap.find lbl bmap in
-                      let new_lbl = label_of side lbl in
-                      let new_bb =
-                        { bb_label = new_lbl;
-                          bb_instrs = List.map (clone_instr side) bb.bb_instrs;
-                          bb_term = clone_term side lbl bb.bb_term }
-                      in
-                      (new_lbl, new_bb)
-                    ) loop_labels
-                  ) [ true; false ]
-                in
+          let new_preheader =
+            { preheader_bb with
+              bb_term = Br (cond, label_of true lp.header, label_of false lp.header) }
+          in
 
-                let new_preheader =
-                  { preheader_bb with
-                    bb_term = Br (cond, label_of true lp.header, label_of false lp.header) }
-                in
+          let orig_bmap = bmap in
+          let bmap =
+            IntMap.fold (fun lbl _ acc ->
+              if IntSet.mem lbl lp.blocks then acc
+              else IntMap.add lbl (IntMap.find lbl bmap) acc
+            ) bmap IntMap.empty
+          in
+          let bmap = IntMap.add preheader new_preheader bmap in
+          let bmap = List.fold_left (fun m (l, bb) -> IntMap.add l bb m) bmap clones in
 
-                let orig_bmap = bmap in
-                let bmap =
-                  IntMap.fold (fun lbl _ acc ->
-                    if IntSet.mem lbl lp.blocks then acc
-                    else IntMap.add lbl (IntMap.find lbl bmap) acc
-                  ) bmap IntMap.empty
-                in
-                let bmap = IntMap.add preheader new_preheader bmap in
-                let bmap = List.fold_left (fun m (l, bb) -> IntMap.add l bb m) bmap clones in
-
-                let bmap =
-                  rewrite_outside_uses bmap orig_bmap loop_labels lp
-                    true_lmap false_lmap true_vmap false_vmap fresh_vreg
-                in
-                Some (bmap, !next_label - 1, !next_vreg - 1)
-              end
-          end
-      | _ -> None
+          let bmap =
+            rewrite_outside_uses bmap orig_bmap loop_labels lp
+              true_lmap false_lmap true_vmap false_vmap fresh_vreg
+          in
+          Some (bmap, !next_label - 1, !next_vreg - 1)
       end
 
 (* 逐函数反复执行 loop unswitch。 *)

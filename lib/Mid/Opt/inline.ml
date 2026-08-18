@@ -7,13 +7,25 @@ module IntMap = Map.Make (Int)
 
 (* ---- 启发式参数 -------------------------------------------------------- *)
 
-let max_inline_instrs  = 15   (* 被内联函数最大指令数 *)
-let max_call_sites    = 3    (* 最多被调用次数 *)
+(* 参考 LLVM InlineCost 的思路，内联决策更接近“cost vs threshold”，
+   而不是只看“最多调用几次”这种硬门槛。 *)
+let base_inline_threshold = 15
+let max_inline_total_growth = 64
 
 (* ---- 辅助: 函数分析 ---------------------------------------------------- *)
 
 let count_instrs (f : func) =
   List.fold_left (fun acc (_, bb) -> acc + List.length bb.bb_instrs) 0 f.f_blocks
+
+let count_blocks (f : func) =
+  List.length f.f_blocks
+
+let count_cond_branches (f : func) =
+  List.fold_left (fun acc (_, bb) ->
+    match bb.bb_term with
+    | Br _ -> acc + 1
+    | Jump _ | Ret _ -> acc
+  ) 0 f.f_blocks
 
 let is_leaf (f : func) =
   not (List.exists (fun (_, bb) ->
@@ -36,12 +48,33 @@ let count_call_sites (m : module_) (target : string) =
     ) acc f.f_blocks
   ) 0 m.m_funcs
 
-let should_inline (m : module_) (f : func) =
+let count_const_args (args : value list) =
+  List.fold_left (fun acc -> function
+    | Imm _ -> acc + 1
+    | VReg _ | Global _ -> acc
+  ) 0 args
+
+let inline_cost (f : func) =
+  (* terminator/CFG 越复杂，真实展开代价越高；这里给分支和额外块加成本。 *)
+  count_instrs f + count_cond_branches f * 2 + max 0 (count_blocks f - 1)
+
+let inline_threshold_for_call (f : func) (args : value list) =
+  let const_args = count_const_args args in
+  (* 参考 LLVM CallAnalyzer 会把调用点实参带入分析：
+     常量实参越多，越可能触发比较/分支折叠，因此提高阈值。 *)
+  base_inline_threshold
+  + const_args * 2
+  + if const_args > 0 then count_cond_branches f * 3 else 0
+
+let should_inline_call (m : module_) (f : func) (args : value list) =
+  let call_sites = count_call_sites m f.f_name in
+  let cost = inline_cost f in
+  let threshold = inline_threshold_for_call f args in
   f.f_name <> "main"
   && not (is_recursive f)
   && is_leaf f
-  && count_instrs f <= max_inline_instrs
-  && count_call_sites m f.f_name <= max_call_sites
+  && cost <= threshold
+  && cost * call_sites <= max_inline_total_growth
 
 (* ---- value / label 重编号 ---------------------------------------------- *)
 
@@ -206,13 +239,13 @@ let inline_one_call (funcs : (string * func) list)
 (* ---- 在主 pass 中反复扫描 call site 并内联 ----------------------------- *)
 
 (* 在函数 f 中寻找对 target 的第一个 call site *)
-let find_call_site (f : func) (target : string) : (label * int) option =
+let find_call_site (f : func) (target : string) : (label * int * value list) option =
   let rec find_in_blocks = function
     | [] -> None
     | (lbl, bb) :: rest ->
         let rec find_in_instrs idx = function
           | [] -> find_in_blocks rest
-          | Call { fn; _ } :: _ when fn = target -> Some (lbl, idx)
+          | Call { fn; args; _ } :: _ when fn = target -> Some (lbl, idx, args)
           | _ :: tl -> find_in_instrs (idx + 1) tl
         in
         find_in_instrs 0 bb.bb_instrs
@@ -220,19 +253,24 @@ let find_call_site (f : func) (target : string) : (label * int) option =
   find_in_blocks f.f_blocks
 
 let run (m : module_) : module_ =
-  (* 找出所有可内联的函数 *)
-  let candidates = List.filter (fun (_, f) -> should_inline m f) m.m_funcs in
+  (* 候选函数先只做结构过滤；真正是否内联，延迟到具体调用点再判定。 *)
+  let candidates = List.filter (fun (_, f) ->
+    f.f_name <> "main" && not (is_recursive f) && is_leaf f
+  ) m.m_funcs in
 
   let rec inline_functions funcs = function
     | [] -> funcs
-    | (callee_name, _) :: rest ->
+    | (callee_name, callee) :: rest ->
       let rec inline_calls funcs =
         (* 在任意非 callee 函数中寻找对 callee 的调用 *)
         match List.find_map (fun (n, f) ->
           if n = callee_name then None
           else match find_call_site f callee_name with
             | None -> None
-            | Some (lbl, idx) -> Some (n, lbl, idx)
+            | Some (lbl, idx, args) ->
+                if should_inline_call { m with m_funcs = funcs } callee args
+                then Some (n, lbl, idx)
+                else None
         ) funcs with
         | None -> funcs
         | Some (caller_name, lbl, idx) ->

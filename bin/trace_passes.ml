@@ -54,11 +54,11 @@ let run_pipeline (initial : stage list) : stage list =
   |> run "dce_2" Dce.run
   |> run "jump_thread_1" Jump_thread.run
   |> run "simplifycfg_1" Simplifycfg.run
-  |> run "dead_store_elim" Dead_store_elim.run
+  |> run "loop_canonicalize" Loop_canonicalize.run
   |> run "licm" Licm.run
   |> run "loop_unswitch" Loop_unswitch.run
-  |> run "loop_eval" Loop_eval.run
   |> run "indvars" Indvars.run
+  |> run "loop_eval" Loop_eval.run
   |> run "loop_unroll" Loop_unroll.run
   |> run "const_fold_3" Const_fold.run
   |> run "copy_prop_2" Copy_prop.run
@@ -66,6 +66,7 @@ let run_pipeline (initial : stage list) : stage list =
   |> run "branch_fold_2" Branch_fold.run
   |> run "dce_3" Dce.run
   |> run "algebraic_2" Algebraic.run
+  |> run "dead_store_elim" Dead_store_elim.run
   |> run "gvn" Gvn.run
   |> run "sccp_3" Sccp.run
   |> run "algebraic_3" Algebraic.run

@@ -1,4 +1,8 @@
-(* ToyC 优化 — 循环旋转 (LLVM: -loop-rotate)
+(* ToyC 优化 — 循环旋转实现细节
+
+   流水线不再直接把这一步作为 “LoopRotate pass” ，
+   而是通过 Loop_canonicalize.run 统一调用。这里保留的是当前
+   规范化 pass 里使用到的 rotate-based 变换实现。
 
    把 while 形式的循环改写成 do-while 形式：
 
@@ -108,33 +112,18 @@ let build_phi_env (header_phis : instr list) (pred : label) : value IntMap.t =
     | _ -> m
   ) IntMap.empty header_phis
 
-(* 在循环旋转后修复 exit 块及其后继 phi 对旧 header vreg 的引用。 *)
-let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
+(* 在循环旋转后修复 loop 外对旧 header 定义值的使用。
+   参考 LLVM 的 SSAUpdater 思路：
+   1. 在 exit block 上为需要外流的 header 值建立出口 phi；
+   2. 把被 exit block 支配到的 loop 外 uses 统一改写到这些出口 phi。 *)
+let rewrite_exit_uses (f : func) (bmap : basic_block IntMap.t)
+    (loop_blocks : IntSet.t) (header_defined : IntSet.t)
     (header : label) (exit_target : label) (preheader : label) (latch : label)
-    (pre_env_final : value IntMap.t) (fresh_vreg : unit -> int)
+    (pre_env_final : value IntMap.t) (latch_env_final : value IntMap.t)
+    (fresh_vreg : unit -> int)
     : basic_block IntMap.t =
   let exit_bb = IntMap.find exit_target bmap in
   let exit_succs = term_succs exit_bb.bb_term in
-  let add_succ_phi_uses acc succ =
-    match IntMap.find_opt succ bmap with
-    | None -> acc
-    | Some sbb ->
-        List.fold_left (fun acc instr ->
-          match instr with
-          | Phi p ->
-              List.fold_left (fun acc (v, pred) ->
-                if pred = exit_target then
-                  match v with
-                  | VReg r -> IntSet.add r acc
-                  | Imm _ | Global _ -> acc
-                else acc)
-                acc p.incoming
-          | _ -> acc)
-          acc sbb.bb_instrs
-  in
-  let succ_phi_uses =
-    List.fold_left add_succ_phi_uses IntSet.empty exit_succs
-  in
   let inserted = ref IntMap.empty in
   let bmap =
     IntMap.map (fun bb ->
@@ -146,7 +135,7 @@ let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
                 let expanded =
                   List.concat_map (fun (v, l) ->
                     if l = header then
-                      [ (v, latch);
+                        [ (map_value latch_env_final v, latch);
                         (map_value pre_env_final v, preheader) ]
                     else
                       [ (v, l) ]
@@ -163,26 +152,7 @@ let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
             | i -> i
           ) bb.bb_instrs
         in
-        let non_phi_uses =
-          List.concat_map (fun instr ->
-            match instr with
-            | Phi _ -> []
-            | i -> instr_uses i)
-            updated_existing_phis
-          @ terminator_uses bb.bb_term
-        in
-        let non_phi_vregs =
-          List.fold_left (fun s v ->
-            match v with
-            | VReg r -> IntSet.add r s
-            | Imm _ | Global _ -> s)
-            IntSet.empty non_phi_uses
-        in
-        let needed =
-          IntSet.inter
-            (IntSet.union non_phi_vregs succ_phi_uses)
-            header_defined
-        in
+          let needed = header_defined in
         let missing =
           IntSet.filter (fun r ->
             not (List.exists (function
@@ -195,7 +165,7 @@ let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
           inserted := IntMap.add r r' !inserted;
           let incoming =
             [ (map_value pre_env_final (VReg r), preheader);
-              (VReg r, latch) ]
+                (map_value latch_env_final (VReg r), latch) ]
           in
           let phi = Phi { dst = r'; incoming } in
           let replace_instr = function
@@ -212,7 +182,8 @@ let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
         missing { bb with bb_instrs = updated_existing_phis }
     ) bmap
   in
-  IntMap.mapi (fun lbl bb ->
+  let bmap =
+    IntMap.mapi (fun lbl bb ->
     if List.mem lbl exit_succs then
       let instrs = List.map (function
         | Phi p ->
@@ -229,7 +200,44 @@ let rewrite_exit_uses (bmap : basic_block IntMap.t) (header_defined : IntSet.t)
             Phi { p with incoming }
         | i -> i) bb.bb_instrs in
       { bb with bb_instrs = instrs }
-    else bb) bmap
+      else bb) bmap
+  in
+  let replace_vreg r =
+    match IntMap.find_opt r !inserted with
+    | Some r' -> Some (VReg r')
+    | None -> None
+  in
+  let map_replaced_value v =
+    match v with
+    | Imm _ | Global _ -> v
+    | VReg r -> Option.value ~default:v (replace_vreg r)
+  in
+  let temp_func =
+    { f with
+      f_blocks =
+        IntMap.bindings bmap |> List.sort (fun (a, _) (b, _) -> compare a b) }
+  in
+  let dom = Dominance.analyze temp_func in
+  IntMap.mapi (fun lbl bb ->
+    let dominated_by_exit =
+      match IntMap.find_opt lbl dom.doms with
+      | Some ds -> IntSet.mem exit_target ds
+      | None -> false
+    in
+    if lbl = exit_target || IntSet.mem lbl loop_blocks || not dominated_by_exit then
+      bb
+    else
+      let instrs =
+        List.map (function
+          | Phi p ->
+              let incoming =
+                List.map (fun (v, pred) -> (map_replaced_value v, pred)) p.incoming
+              in
+              Phi { p with incoming }
+          | i -> Loop_unroll.map_instr_values replace_vreg i) bb.bb_instrs
+      in
+      let term = Loop_unroll.map_term_values replace_vreg bb.bb_term in
+      { bb with bb_instrs = instrs; bb_term = term }) bmap
 
 (* 对满足条件的循环执行一次 do-while 旋转；失败返回 None。 *)
 let rotate_loop (f : func) (bmap : basic_block IntMap.t) (lp : loop)
@@ -307,8 +315,9 @@ let rotate_loop (f : func) (bmap : basic_block IntMap.t) (lp : loop)
                               IntSet.empty (header_phis @ header_rest)
                           in
                           let bmap =
-                            rewrite_exit_uses bmap header_defined header exit_target
-                              preheader latch pre_env_final fresh_vreg
+                              rewrite_exit_uses f bmap lp.blocks header_defined
+                                header exit_target preheader latch
+                                pre_env_final latch_env_final fresh_vreg
                           in
                           Some (bmap, !next_vreg - 1)
                         with Exit -> None
