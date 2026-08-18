@@ -15,9 +15,9 @@ let compile source : string =
   let ir = Mem2reg.promote ir in
   
   (* 5. IR 优化 *)
-  (*let ir = Const_fold.run ir in      (* 常量折叠 *)
+  (*let ir = Const_fold.run ir in      (* 常量折叠 *)*)
   let ir = Reassociate.run ir in      (* 重关联 *)
-  let ir = Const_fold.run ir in       (* 再折叠, reassociate 暴露新常量 *)
+  (*let ir = Const_fold.run ir in       再折叠, reassociate 暴露新常量 *)
   let ir = Inline.run ir in           (* 函数内联 *)
   let ir = Deadarg_elim.run ir in     (* 死参数消除  *)
   let ir = Globaldce.run ir in        (* 全局死代码消除 *)
@@ -27,7 +27,7 @@ let compile source : string =
   let ir = Cse.run ir in              (* 公共子表达式消除 *)
   let ir = Dce.run ir in              (* 死代码消除 *)
   let ir = Const_prop.run ir in       (* 常量传播 *)
-(
+(* 
   let ir = Sccp.run ir in             (* 稀疏条件常量传播 *)
   let ir = Branch_fold.run ir in      (* 常量分支折叠 + 不可达块删除 *)
   let ir = Dce.run ir in              (* 清理 Branch_fold 产生的死代码 *)
@@ -54,7 +54,7 @@ let compile source : string =
   let ir = Gvn.run ir in              (* 全局值编号 *)
   let ir = Sccp.run ir in
   let ir = Algebraic.run ir in
-  let ir = Jump_thread.run ir in *)
+  let ir = Jump_thread.run ir in  *)
   (* let ir = Simplifycfg.run ir in   ← 同上: 在 Loop_unroll 之后, 待图着色分配器落地后再开 *)
 
   
