@@ -1,0 +1,9 @@
+(include_subdirs unqualified)
+
+(ocamllex lexer)
+
+(menhir
+ (modules parser))
+
+(library
+ (name compiler_lib))

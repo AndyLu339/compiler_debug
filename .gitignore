@@ -1,0 +1,16 @@
+_build/
+*.exe
+*.bc
+*.cmi
+*.cmo
+*.cmx
+*.o
+*.annot
+*.native
+.merlin
+CODEX.md
+CLAUDE.md
+docs/
+.testrun/
+__pycache__/
+test/asm

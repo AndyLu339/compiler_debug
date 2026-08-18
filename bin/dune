@@ -1,0 +1,11 @@
+(executable
+ (name main)
+ (libraries compiler_lib))
+
+(executable
+ (name dump_ir)
+ (libraries compiler_lib))
+
+(executable
+ (name trace_passes)
+ (libraries compiler_lib))
