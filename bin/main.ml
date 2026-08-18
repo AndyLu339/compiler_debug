@@ -35,7 +35,7 @@ let compile source : string =
   let ir = Simplifycfg.run ir in      (* 控制流化简: 块合并 + phi 简化 + 分支化简 *)
 
   (* loop opts *)
-  (*let ir = Loop_canonicalize.run ir in (* 循环规范化，整理简单 while-loop 形状与出口 SSA *)
+  let ir = Loop_canonicalize.run ir in (* 循环规范化，整理简单 while-loop 形状与出口 SSA *)
   let ir = Licm.run ir in             (* 循环不变量外提  *)
   let ir = Loop_unswitch.run ir in    (* 循环分支外提 *)
   let ir = Indvars.run ir in          (* 归纳变量化简 + 强度削减  *)
@@ -45,8 +45,9 @@ let compile source : string =
   (* loop cleanup: 继续吃掉循环变换暴露出的常量、copy、死分支和死代码 *)
   let ir = Const_fold.run ir in
   let ir = Copy_prop.run ir in
+  
   let ir = Sccp.run ir in
-  let ir = Branch_fold.run ir in
+  (*let ir = Branch_fold.run ir in
   let ir = Dce.run ir in
   let ir = Algebraic.run ir in        (* 再代数化简 *)
   let ir = Dead_store_elim.run ir in  (* 循环变换后再做 DSE，收益更稳定 *)
