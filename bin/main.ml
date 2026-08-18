@@ -52,9 +52,9 @@ let compile source : string =
   let ir = Algebraic.run ir in        (* 再代数化简 *)
   let ir = Dead_store_elim.run ir in  (* 循环变换后再做 DSE，收益更稳定 *)
 
-  (*let ir = Gvn.run ir in              (* 全局值编号 *)
+  let ir = Gvn.run ir in              (* 全局值编号 *)
   let ir = Sccp.run ir in
-  let ir = Algebraic.run ir in
+  (*let ir = Algebraic.run ir in
   let ir = Jump_thread.run ir in  *)
   (* let ir = Simplifycfg.run ir in   ← 同上: 在 Loop_unroll 之后, 待图着色分配器落地后再开 *)
 
